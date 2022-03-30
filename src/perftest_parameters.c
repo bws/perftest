@@ -3,6 +3,7 @@
 #include <string.h>
 #include <getopt.h>
 #include <limits.h>
+#include <mpi.h>
 #include <arpa/inet.h>
 #if defined(__FreeBSD__)
 #include <netinet/in.h>
@@ -3375,10 +3376,40 @@ void print_report_bw (struct perftest_parameters *user_param, struct bw_report_d
 	my_bw_rep->msgRate_avg_p2 = msgRate_avg_p2;
 	my_bw_rep->sl = user_param->sl;
 
-	if (!user_param->duplex || (user_param->verb == SEND && user_param->test_type == DURATION)
-			|| user_param->test_method == RUN_INFINITELY || user_param->connection_type == RawEth)
-		print_full_bw_report(user_param, my_bw_rep, NULL);
+	//if (!user_param->duplex || (user_param->verb == SEND && user_param->test_type == DURATION)
+	//		|| user_param->test_method == RUN_INFINITELY || user_param->connection_type == RawEth)
+	//	print_full_bw_report(user_param, my_bw_rep, NULL);
 
+	/* Perform a series of reductions to print only 1 report */
+	int size;
+	int rank;
+	MPI_Comm_size(MPI_COMM_WORLD, &size);
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	int *ranks = calloc(sizeof(int), size);
+	for (int i = size/2; i < size; i++) {
+		ranks[i - size/2] = i;
+	}
+	MPI_Group world_group;
+	MPI_Group client_group;
+    MPI_Comm_group(MPI_COMM_WORLD, &world_group);
+	MPI_Group_incl(world_group, size/2, ranks, &client_group);
+
+	int crank;
+	MPI_Comm client_comm;
+	MPI_Comm_create_group(MPI_COMM_WORLD, client_group, 0, &client_comm);
+	MPI_Comm_rank(client_comm, &crank);
+	fprintf(stderr, "Rank %d: Comm created\n", rank);
+	int titers = 0;
+	double bw = 0.0;
+	double mrate = 0.0;
+	MPI_Reduce(&(my_bw_rep->iters), &titers, 1, MPI_INT, MPI_SUM, 0, client_comm);
+	MPI_Reduce(&(my_bw_rep->bw_avg), &bw, 1, MPI_DOUBLE, MPI_SUM, 0, client_comm);
+	MPI_Reduce(&(my_bw_rep->msgRate_avg), &mrate, 1, MPI_DOUBLE, MPI_SUM, 0, client_comm);
+	if (crank == 0) {
+		fprintf(stdout, "Rk %d: %ld \t %d \t\t %4.4f \t\t %4.4f \t\t %4.4f\n", 
+				rank, my_bw_rep->size, titers, 0.0, bw, mrate);
+	}
+	MPI_Barrier(client_comm);
 	if (free_my_bw_rep == 1) {
 		free(my_bw_rep);
 	}

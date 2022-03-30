@@ -37,12 +37,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <limits.h>
+
+#include <mpi.h>
 
 #include "perftest_parameters.h"
 #include "perftest_resources.h"
 #include "multicast_resources.h"
 #include "perftest_communication.h"
 
+#include "timer.h"
 /******************************************************************************
  *
  ******************************************************************************/
@@ -165,6 +170,20 @@ int main(int argc, char *argv[])
 	int                      	ret_parser, i = 0, rc;
 	int                      	size_max_pow = 24;
 
+	int size = 0;
+	int rank = 0;
+	/* Initialize MPI and check preconditions */
+	MPI_Init(&argc, &argv);
+	MPI_Comm_size(MPI_COMM_WORLD, &size);
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+	/* Require an even number of ranks */
+	fprintf(stderr, "Rank %d: Size %d\n", rank, size);
+	if ((size > 0) && (size & 1)) {
+		fprintf(stderr, "ERROR: Must use an even number of ranks with the MPI enabled version\n");
+		return FAILURE;
+	}
+
 	/* init default values to user's parameters */
 	memset(&ctx, 0,sizeof(struct pingpong_context));
 	memset(&user_param, 0 , sizeof(struct perftest_parameters));
@@ -190,6 +209,35 @@ int main(int argc, char *argv[])
 		fprintf(stderr," This test cannot run Raw Ethernet QPs (you have chosen RawEth as connection type\n");
 		fprintf(stderr," For this we have raw_ethernet_bw test in this package.\n");
 		return FAILURE;
+	}
+
+	/* Initialize the timer */
+	timer_init(user_param.iters);
+
+	/* Make first half of MPI ranks servers and second half clients */
+	MPI_Barrier(MPI_COMM_WORLD);
+	char svrname[HOST_NAME_MAX + 1] = {'\0'};
+	int port = 18515;
+	if (rank < (size/2)) {
+		int crank = rank + (size/2);
+		gethostname(svrname, HOST_NAME_MAX);
+		MPI_Send(svrname, HOST_NAME_MAX, MPI_CHAR, crank, 0, MPI_COMM_WORLD);
+		port += rank;
+		MPI_Send(&port, 1, MPI_INT, crank, 0, MPI_COMM_WORLD);
+		user_param.port = port;
+	}
+	else {
+		MPI_Status status;
+		int srank = rank - (size/2);
+		MPI_Recv(svrname, HOST_NAME_MAX, MPI_CHAR, srank, 0, MPI_COMM_WORLD, &status);
+		MPI_Recv(&port, 1, MPI_INT, rank - (size/2), 0, MPI_COMM_WORLD, &status);
+		printf("Rank %d: shn: %s port: %d\n", srank, svrname, port);
+		user_param.servername = svrname;
+		user_param.port = port;
+		user_param.machine = CLIENT;
+
+		/* Pause the clients so the servers can setup sockets */
+		sleep(1);
 	}
 
 	/* Finding the IB device selected (or defalut if no selected). */
@@ -426,6 +474,7 @@ int main(int argc, char *argv[])
 					ctx.credit_buf[j] = 0;
 			}
 
+			MPI_Barrier(MPI_COMM_WORLD);
 			if (user_param.duplex) {
 				if(run_iter_bi(&ctx,&user_param))
 					return 17;
@@ -442,8 +491,14 @@ int main(int argc, char *argv[])
 					return 17;
 				}
 			}
+			/* Mixing verbs and MPI is buggy -- so add a sleep to let the trial complete before moving on */
+			sleep(3);
+			MPI_Barrier(MPI_COMM_WORLD);
 
-			print_report_bw(&user_param,&my_bw_rep);
+			/* For MPI runs only have the client print results */
+			if (user_param.machine == CLIENT) {
+				print_report_bw(&user_param,&my_bw_rep);
+			}
 
 			if (user_param.duplex && user_param.test_type != DURATION) {
 				xchg_bw_reports(&user_comm, &my_bw_rep,&rem_bw_rep,atof(user_param.rem_version));
@@ -477,6 +532,7 @@ int main(int argc, char *argv[])
 			return FAILURE;
 		}
 
+		MPI_Barrier(MPI_COMM_WORLD);
 		if (user_param.duplex) {
 
 			if(run_iter_bi(&ctx,&user_param))
@@ -492,8 +548,13 @@ int main(int argc, char *argv[])
 
 			return 17;
 		}
+		sleep(3);
+		MPI_Barrier(MPI_COMM_WORLD);
 
-		print_report_bw(&user_param,&my_bw_rep);
+		/* Modify reporting for MPI so that only clients participate */
+		if (user_param.machine == CLIENT) {
+			print_report_bw(&user_param,&my_bw_rep);
+		}
 
 		if (user_param.duplex && user_param.test_type != DURATION) {
 			xchg_bw_reports(&user_comm, &my_bw_rep,&rem_bw_rep,atof(user_param.rem_version));
@@ -549,7 +610,9 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	/* Change reporting so that servers are silent and clients print their rank */
 	if (user_param.output == FULL_VERBOSITY) {
+		printf("Rank: %d ", rank);
 		if (user_param.report_per_port)
 			printf(RESULT_LINE_PER_PORT);
 		else
@@ -584,5 +647,7 @@ int main(int argc, char *argv[])
 		return FAILURE;
 	}
 
+	timer_destroy();
+	MPI_Finalize();
 	return 0;
 }
